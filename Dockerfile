@@ -14,6 +14,9 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 # Build-time gateway URL (overridden at runtime by CLAW3D_GATEWAY_URL).
 ENV NEXT_PUBLIC_GATEWAY_URL=ws://127.0.0.1:18789
+# Security headers are baked in at build time; see next.config.ts.
+ARG CLAW3D_ALLOW_HTTP=false
+ENV CLAW3D_ALLOW_HTTP=${CLAW3D_ALLOW_HTTP}
 RUN npm run build
 
 FROM node:20-slim AS runner

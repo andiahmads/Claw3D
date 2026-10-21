@@ -3,7 +3,10 @@
 # at ws://localhost:18789 without exposing the gateway port.
 services:
   studio:
-    build: .
+    build:
+      context: .
+      args:
+        CLAW3D_ALLOW_HTTP: ${CLAW3D_ALLOW_HTTP:-true}
     image: claw3d:local
     restart: unless-stopped
     environment:

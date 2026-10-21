@@ -3,6 +3,7 @@ import path from "node:path";
 
 // Set CLAW3D_ALLOW_HTTP=true when Studio is served over plain HTTP (e.g. a
 // private Tailscale IP); otherwise browsers upgrade every asset to HTTPS.
+// Read at build time: Next.js bakes headers() into the build output.
 const allowHttp = process.env.CLAW3D_ALLOW_HTTP === "true";
 
 const securityHeaders = [
