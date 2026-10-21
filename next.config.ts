@@ -1,6 +1,10 @@
 import type { NextConfig } from "next";
 import path from "node:path";
 
+// Set CLAW3D_ALLOW_HTTP=true when Studio is served over plain HTTP (e.g. a
+// private Tailscale IP); otherwise browsers upgrade every asset to HTTPS.
+const allowHttp = process.env.CLAW3D_ALLOW_HTTP === "true";
+
 const securityHeaders = [
   {
     key: "Content-Security-Policy",
@@ -24,7 +28,7 @@ const securityHeaders = [
       "media-src 'self' blob: data: http: https:",
       "worker-src 'self' blob:",
       "object-src 'none'",
-      "upgrade-insecure-requests",
+      ...(allowHttp ? [] : ["upgrade-insecure-requests"]),
     ].join("; "),
   },
   {
@@ -49,7 +53,7 @@ const securityHeaders = [
   },
 ];
 
-if (process.env.NODE_ENV === "production") {
+if (process.env.NODE_ENV === "production" && !allowHttp) {
   securityHeaders.push({
     key: "Strict-Transport-Security",
     value: "max-age=31536000; includeSubDomains",

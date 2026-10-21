@@ -14,6 +14,8 @@ services:
       CLAW3D_GATEWAY_TOKEN: ${CLAW3D_GATEWAY_TOKEN:-}
       CLAW3D_GATEWAY_ADAPTER_TYPE: ${CLAW3D_GATEWAY_ADAPTER_TYPE:-demo}
       # Required in production: hostnames Studio may proxy to (comma-separated).
+      # Served over plain HTTP: skip the CSP HTTPS upgrade and HSTS.
+      CLAW3D_ALLOW_HTTP: ${CLAW3D_ALLOW_HTTP:-true}
       UPSTREAM_ALLOWLIST: ${UPSTREAM_ALLOWLIST:-localhost,127.0.0.1}
     ports:
       - "${CLAW3D_BIND:-127.0.0.1}:${CLAW3D_PORT:-3000}:3000"
