@@ -1,0 +1,30 @@
+# Claw3D Studio + bundled demo gateway.
+# The demo gateway shares the studio's network namespace so Studio can reach it
+# at ws://localhost:18789 without exposing the gateway port.
+services:
+  studio:
+    build: .
+    image: claw3d:local
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      STUDIO_ACCESS_TOKEN: ${STUDIO_ACCESS_TOKEN:?set STUDIO_ACCESS_TOKEN in .env}
+      CLAW3D_GATEWAY_URL: ${CLAW3D_GATEWAY_URL:-ws://localhost:18789}
+      CLAW3D_GATEWAY_TOKEN: ${CLAW3D_GATEWAY_TOKEN:-}
+      CLAW3D_GATEWAY_ADAPTER_TYPE: ${CLAW3D_GATEWAY_ADAPTER_TYPE:-demo}
+    ports:
+      - "${CLAW3D_BIND:-127.0.0.1}:${CLAW3D_PORT:-3000}:3000"
+    volumes:
+      - studio-state:/root/.openclaw
+
+  demo-gateway:
+    image: claw3d:local
+    restart: unless-stopped
+    command: ["node", "server/demo-gateway-adapter.js"]
+    network_mode: "service:studio"
+    depends_on:
+      - studio
+
+volumes:
+  studio-state:

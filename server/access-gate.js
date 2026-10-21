@@ -103,8 +103,39 @@ function createAccessGate(options) {
     return { authorized: false, limited: rateLimiter.isLimited(ip) };
   };
 
+  /**
+   * Allow a one-time login via `?access_token=<token>`: on match, set the
+   * access cookie and redirect to the same URL without the token.
+   */
+  const handleTokenLogin = (req, res) => {
+    let url;
+    try {
+      url = new URL(req.url || "/", "http://localhost");
+    } catch {
+      return false;
+    }
+    const supplied = url.searchParams.get("access_token");
+    if (supplied === null) return false;
+    const ip = resolveClientIp(req);
+    if (rateLimiter.isLimited(ip) || !safeCompare(supplied, token)) {
+      rateLimiter.recordFailure(ip);
+      return false;
+    }
+    rateLimiter.reset(ip);
+    url.searchParams.delete("access_token");
+    res.statusCode = 302;
+    res.setHeader(
+      "Set-Cookie",
+      `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`
+    );
+    res.setHeader("Location", `${url.pathname}${url.search}`);
+    res.end();
+    return true;
+  };
+
   const handleHttp = (req, res) => {
     if (!enabled) return false;
+    if (handleTokenLogin(req, res)) return true;
     const auth = getAuthState(req);
     if (!auth.authorized) {
       const statusCode = auth.limited ? 429 : 401;
