@@ -37,10 +37,27 @@ services:
       HERMES_API_KEY: ${HERMES_API_KEY:-}
       HERMES_MODEL: ${HERMES_MODEL:-hermes}
       HERMES_AGENT_NAME: ${HERMES_AGENT_NAME:-Hermes}
+      # Remote browser for agents (unset to disable the browser_* tools).
+      BROWSER_WS_URL: ${BROWSER_WS_URL:-ws://browser:3000/}
+    # Logins agents may use as {{secret:NAME}}: BROWSER_SECRET_NAME=value lines.
+    env_file:
+      - path: browser-secrets.env
+        required: false
     volumes:
       - gateway-state:/root/.hermes
     depends_on:
       - studio
+      - browser
+
+  # Shared headless Chromium, reachable only inside the compose network.
+  browser:
+    image: mcr.microsoft.com/playwright:v1.58.0-noble
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    user: pwuser
+    working_dir: /home/pwuser
+    command: ["npx", "-y", "playwright@1.58.0", "run-server", "--port", "3000", "--host", "0.0.0.0"]
 
 volumes:
   studio-state:

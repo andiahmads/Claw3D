@@ -12,6 +12,7 @@
  *
  * Every agent (orchestrator and sub-agents) can also:
  *   - fetch_url(url) — read a public web page / Google Sheet / Google Doc
+ *   - browser_* — drive a remote Chromium (login, forms, clicks); see browser-tools.js
  *
  * Sub-agents appear as 3D characters in the office, each with their own
  * conversation history, system prompt, and settings.
@@ -31,6 +32,7 @@ const path = require("path");
 const dns = require("dns").promises;
 const net = require("net");
 const { WebSocketServer } = require("ws");
+const { BROWSER_TOOLS, runBrowserTool, isBrowserTool, redactSecrets: redactBrowserSecrets } = require("./browser-tools");
 
 function loadDotenvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -72,7 +74,8 @@ const AGENT_ID = "hermes";
 const MAIN_KEY = "main";
 const MAIN_SESSION_KEY = `agent:${AGENT_ID}:${MAIN_KEY}`;
 const CONFIG_PATH = `${HOME}/.hermes/config.json`;
-const MAX_TOOL_ROUNDS = 8;
+// Browser workflows (login, navigate, fill, submit) need many tool rounds.
+const MAX_TOOL_ROUNDS = 30;
 const FETCH_TIMEOUT_MS = 20_000;
 const FETCH_MAX_BYTES = 2 * 1024 * 1024;
 const FETCH_MAX_CHARS = 30_000;
@@ -227,6 +230,7 @@ const WEB_TOOLS = [
       },
     },
   },
+  ...(process.env.BROWSER_WS_URL ? BROWSER_TOOLS : []),
 ];
 
 const ORCHESTRATOR_TOOLS = [...TEAM_TOOLS, ...WEB_TOOLS];
@@ -901,7 +905,20 @@ async function execFetchUrl(args) {
   }
 }
 
-async function executeToolCall(tc, sendEvent) {
+async function execBrowserTool(name, args, agentId) {
+  try {
+    const result = await runBrowserTool(name, args, {
+      agentId,
+      assertPublicUrl,
+      log: (message) => console.log(`[hermes-adapter] ${message} (agent ${agentId})`),
+    });
+    return JSON.stringify(result);
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: redactBrowserSecrets(sanitizeErrorMessage(err) || "Browser action failed.") });
+  }
+}
+
+async function executeToolCall(tc, sendEvent, agentId) {
   console.log(`[hermes-adapter] Tool call: ${tc.name}`, JSON.stringify(tc.args).slice(0, 120));
   switch (tc.name) {
     case "spawn_agent":          return execSpawnAgent(tc.args, sendEvent);
@@ -911,7 +928,9 @@ async function executeToolCall(tc, sendEvent) {
     case "dismiss_agent":        return execDismissAgent(tc.args);
     case "read_agent_context":   return execReadAgentContext(tc.args);
     case "fetch_url":            return execFetchUrl(tc.args);
-    default:                     return JSON.stringify({ ok: false, error: `Unknown tool: ${tc.name}` });
+    default:
+      if (isBrowserTool(tc.name)) return execBrowserTool(tc.name, tc.args, agentId);
+      return JSON.stringify({ ok: false, error: `Unknown tool: ${tc.name}` });
   }
 }
 
@@ -954,7 +973,7 @@ async function runAgenticLoop({ sessionKey, agentId, userMessage, model, tools, 
       // Execute all tool calls and collect results
       const toolResults = await Promise.all(
         toolCalls.map(async (tc) => {
-          const result = await executeToolCall(tc, sendEvent);
+          const result = await executeToolCall(tc, sendEvent, agentId);
           return { role: "tool", tool_call_id: tc.id, content: result };
         })
       );
