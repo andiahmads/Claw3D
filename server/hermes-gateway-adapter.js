@@ -875,7 +875,10 @@ async function execFetchUrl(args) {
     const contentType = res.headers.get("content-type") || "";
     const { buffer, truncated } = await readBodyLimited(res);
     let text = buffer.toString("utf8");
+    let title = null;
     if (contentType.includes("html")) {
+      const titleMatch = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      title = titleMatch ? htmlToText(titleMatch[1]) : null;
       // Google returns its sign-in page for files that are not shared publicly.
       if (url.hostname.endsWith("google.com") && /accounts\.google\.com|ServiceLogin/.test(text)) {
         return JSON.stringify({ ok: false, status: res.status, error: "This Google file is private. Ask the user to share it as 'Anyone with the link can view'." });
@@ -889,6 +892,7 @@ async function execFetchUrl(args) {
       status: res.status,
       url: url.toString(),
       content_type: contentType,
+      title,
       truncated: truncated || clipped,
       content: text.slice(0, FETCH_MAX_CHARS),
     });
