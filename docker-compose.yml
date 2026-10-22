@@ -25,13 +25,23 @@ services:
     volumes:
       - studio-state:/root/.openclaw
 
-  demo-gateway:
+  # Gateway adapter: demo-gateway-adapter.js (mock agents) or
+  # hermes-gateway-adapter.js (any OpenAI-compatible API, e.g. DeepSeek).
+  gateway:
     image: claw3d:local
     restart: unless-stopped
-    command: ["node", "server/demo-gateway-adapter.js"]
+    command: ["node", "server/${CLAW3D_GATEWAY_SCRIPT:-demo-gateway-adapter.js}"]
     network_mode: "service:studio"
+    environment:
+      HERMES_API_URL: ${HERMES_API_URL:-http://localhost:8642}
+      HERMES_API_KEY: ${HERMES_API_KEY:-}
+      HERMES_MODEL: ${HERMES_MODEL:-hermes}
+      HERMES_AGENT_NAME: ${HERMES_AGENT_NAME:-Hermes}
+    volumes:
+      - gateway-state:/root/.hermes
     depends_on:
       - studio
 
 volumes:
   studio-state:
+  gateway-state:
