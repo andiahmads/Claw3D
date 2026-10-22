@@ -10,6 +10,9 @@
  *   - configure_agent(agent_id, ...)
  *   - dismiss_agent(agent_id)
  *
+ * Every agent (orchestrator and sub-agents) can also:
+ *   - fetch_url(url) — read a public web page / Google Sheet / Google Doc
+ *
  * Sub-agents appear as 3D characters in the office, each with their own
  * conversation history, system prompt, and settings.
  *
@@ -25,6 +28,8 @@ const http = require("http");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const dns = require("dns").promises;
+const net = require("net");
 const { WebSocketServer } = require("ws");
 
 function loadDotenvFile(filePath) {
@@ -68,6 +73,10 @@ const MAIN_KEY = "main";
 const MAIN_SESSION_KEY = `agent:${AGENT_ID}:${MAIN_KEY}`;
 const CONFIG_PATH = `${HOME}/.hermes/config.json`;
 const MAX_TOOL_ROUNDS = 8;
+const FETCH_TIMEOUT_MS = 20_000;
+const FETCH_MAX_BYTES = 2 * 1024 * 1024;
+const FETCH_MAX_CHARS = 30_000;
+const FETCH_MAX_REDIRECTS = 5;
 
 // ---------------------------------------------------------------------------
 // Orchestrator system prompt
@@ -194,6 +203,33 @@ const TEAM_TOOLS = [
     },
   },
 ];
+
+// ---------------------------------------------------------------------------
+// Web tools (available to every agent)
+// ---------------------------------------------------------------------------
+
+const WEB_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "fetch_url",
+      description:
+        "Fetch a public http(s) URL and return its content as text. " +
+        "Google Sheets links are returned as CSV and Google Docs links as plain text " +
+        "(the file must be shared as 'Anyone with the link can view'). " +
+        "HTML pages are converted to readable text. Use this whenever the user gives you a link.",
+      parameters: {
+        type: "object",
+        required: ["url"],
+        properties: {
+          url: { type: "string", description: "Full http(s) URL to fetch" },
+        },
+      },
+    },
+  },
+];
+
+const ORCHESTRATOR_TOOLS = [...TEAM_TOOLS, ...WEB_TOOLS];
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -611,13 +647,7 @@ async function execDelegateTask(args) {
   if (!agent) return JSON.stringify({ ok: false, error: `Agent ${targetId} not found` });
 
   const sessionKey = `agent:${targetId}:${MAIN_KEY}`;
-  const history = getHistory(sessionKey);
   const model = agent.settings.model || HERMES_MODEL;
-
-  // Build messages for sub-agent
-  const systemMsg = agent.systemPrompt ? [{ role: "system", content: agent.systemPrompt }] : [];
-  const contextHistory = agent.settings.wipe ? [] : [...history];
-  const messages = [...systemMsg, ...contextHistory, { role: "user", content: message }];
 
   // Emit chat start event for this sub-agent
   const subRunId = randomId();
@@ -631,18 +661,15 @@ async function execDelegateTask(args) {
 
   let responseText = "";
   try {
-    const result = await streamOneTurn(messages, model, [], (partial) => {
-      responseText = partial;
-      emitSub("delta", { message: { role: "assistant", content: partial } });
-    }, null);
-    responseText = result.textContent;
-
-    // Persist to sub-agent history
-    if (agent.settings.continuity !== false) {
-      history.push({ role: "user", content: message });
-      history.push({ role: "assistant", content: responseText });
-      saveHistoryToDisk();
-    }
+    // Sub-agents run the full tool loop (web tools only); it also persists history.
+    responseText = await runAgenticLoop({
+      sessionKey, agentId: targetId, userMessage: message,
+      model, tools: WEB_TOOLS,
+      emitDelta: (partial) => {
+        emitSub("delta", { message: { role: "assistant", content: partial } });
+      },
+      abortCheck: () => false,
+    });
 
     emitSub("final", { stopReason: "end_turn", message: { role: "assistant", content: responseText } });
 
@@ -739,6 +766,137 @@ function execReadAgentContext(args) {
   });
 }
 
+// Block loopback, private, link-local, CGNAT (Tailscale) and other non-public
+// ranges so agents cannot reach Studio, the gateway, or other hosts on the vm.
+const BLOCKED_NETWORKS = (() => {
+  const list = new net.BlockList();
+  for (const [addr, prefix] of [
+    ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+    ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16],
+    ["198.18.0.0", 15], ["224.0.0.0", 4], ["240.0.0.0", 4],
+  ]) list.addSubnet(addr, prefix, "ipv4");
+  for (const [addr, prefix] of [
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) is unwrapped in assertPublicUrl instead:
+    // BlockList treats every IPv4 address as inside ::ffff:0:0/96.
+    ["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+  ]) list.addSubnet(addr, prefix, "ipv6");
+  return list;
+})();
+
+async function assertPublicUrl(url) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Only http and https URLs are allowed.");
+  }
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  const addresses = net.isIP(host)
+    ? [{ address: host, family: net.isIP(host) }]
+    : await dns.lookup(host, { all: true });
+  for (const entry of addresses) {
+    const mapped = entry.address.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    const address = mapped ? mapped[1] : entry.address;
+    const type = mapped || entry.family === 4 ? "ipv4" : "ipv6";
+    if (BLOCKED_NETWORKS.check(address, type)) {
+      throw new Error("That address is private or internal and cannot be fetched.");
+    }
+  }
+}
+
+// Rewrite Google Sheets / Docs share links to their plain export endpoints.
+function rewriteGoogleUrl(url) {
+  if (url.hostname !== "docs.google.com") return url;
+  const sheet = url.pathname.match(/^\/spreadsheets\/d\/([^/]+)/);
+  if (sheet) {
+    const gid = url.searchParams.get("gid") || (url.hash.match(/gid=(\d+)/) || [])[1];
+    const out = new URL(`https://docs.google.com/spreadsheets/d/${sheet[1]}/export`);
+    out.searchParams.set("format", "csv");
+    if (gid) out.searchParams.set("gid", gid);
+    return out;
+  }
+  const doc = url.pathname.match(/^\/document\/d\/([^/]+)/);
+  if (doc) {
+    const out = new URL(`https://docs.google.com/document/d/${doc[1]}/export`);
+    out.searchParams.set("format", "txt");
+    return out;
+  }
+  return url;
+}
+
+function htmlToText(html) {
+  return html
+    .replace(/<(script|style|noscript|svg)[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<(br|\/p|\/div|\/li|\/tr|\/h[1-6])[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n\n")
+    .trim();
+}
+
+async function readBodyLimited(res) {
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > FETCH_MAX_BYTES) {
+      await reader.cancel();
+      return { buffer: Buffer.concat(chunks), truncated: true };
+    }
+    chunks.push(value);
+  }
+  return { buffer: Buffer.concat(chunks), truncated: false };
+}
+
+async function execFetchUrl(args) {
+  const raw = typeof args.url === "string" ? args.url.trim() : "";
+  let url;
+  try {
+    url = rewriteGoogleUrl(new URL(raw));
+  } catch {
+    return JSON.stringify({ ok: false, error: "Invalid URL." });
+  }
+  try {
+    let res;
+    for (let hop = 0; ; hop++) {
+      await assertPublicUrl(url);
+      res = await fetch(url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        headers: { "User-Agent": "Claw3D-Agent/1.0", Accept: "text/html,text/plain,text/csv,application/json,*/*" },
+      });
+      if (res.status < 300 || res.status >= 400) break;
+      const location = res.headers.get("location");
+      if (!location || hop >= FETCH_MAX_REDIRECTS) break;
+      url = new URL(location, url);
+    }
+    const contentType = res.headers.get("content-type") || "";
+    const { buffer, truncated } = await readBodyLimited(res);
+    let text = buffer.toString("utf8");
+    if (contentType.includes("html")) {
+      // Google returns its sign-in page for files that are not shared publicly.
+      if (url.hostname.endsWith("google.com") && /accounts\.google\.com|ServiceLogin/.test(text)) {
+        return JSON.stringify({ ok: false, status: res.status, error: "This Google file is private. Ask the user to share it as 'Anyone with the link can view'." });
+      }
+      text = htmlToText(text);
+    }
+    const clipped = text.length > FETCH_MAX_CHARS;
+    console.log(`[hermes-adapter] fetch_url ${url.hostname} -> ${res.status} (${text.length} chars)`);
+    return JSON.stringify({
+      ok: res.ok,
+      status: res.status,
+      url: url.toString(),
+      content_type: contentType,
+      truncated: truncated || clipped,
+      content: text.slice(0, FETCH_MAX_CHARS),
+    });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: sanitizeErrorMessage(err) || "Fetch failed." });
+  }
+}
+
 async function executeToolCall(tc, sendEvent) {
   console.log(`[hermes-adapter] Tool call: ${tc.name}`, JSON.stringify(tc.args).slice(0, 120));
   switch (tc.name) {
@@ -748,6 +906,7 @@ async function executeToolCall(tc, sendEvent) {
     case "configure_agent":      return execConfigureAgent(tc.args);
     case "dismiss_agent":        return execDismissAgent(tc.args);
     case "read_agent_context":   return execReadAgentContext(tc.args);
+    case "fetch_url":            return execFetchUrl(tc.args);
     default:                     return JSON.stringify({ ok: false, error: `Unknown tool: ${tc.name}` });
   }
 }
@@ -991,7 +1150,7 @@ async function handleMethod(method, params, id, sendEvent) {
 
         try {
           // Only the orchestrator gets team management tools
-          const tools = isOrchestrator ? TEAM_TOOLS : [];
+          const tools = isOrchestrator ? ORCHESTRATOR_TOOLS : WEB_TOOLS;
 
           const finalText = await runAgenticLoop({
             sessionKey, agentId: sessionAgentId, userMessage,
